@@ -1,0 +1,20 @@
+
+@import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  margin: 0;
+  font-family: "Space Grotesk", system-ui, sans-serif;
+  background: radial-gradient(circle at top, #1f2a44, #0b1220 60%),
+    radial-gradient(circle at 20% 20%, rgba(56, 189, 248, 0.15), transparent 40%),
+    radial-gradient(circle at 80% 10%, rgba(34, 197, 94, 0.12), transparent 35%);
+  color: #f8fafc;
+  min-height: 100vh;
+}
+
+#root {
+  min-height: 100vh;
+}
