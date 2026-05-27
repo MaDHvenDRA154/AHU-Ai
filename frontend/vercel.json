@@ -1,0 +1,20 @@
+{
+  "rewrites": [
+    {
+      "source": "/query",
+      "destination": "https://ahu-ai.onrender.com/query"
+    },
+    {
+      "source": "/upload",
+      "destination": "https://ahu-ai.onrender.com/upload"
+    },
+    {
+      "source": "/preview",
+      "destination": "https://ahu-ai.onrender.com/preview"
+    },
+    {
+      "source": "/columns",
+      "destination": "https://ahu-ai.onrender.com/columns"
+    }
+  ]
+}
