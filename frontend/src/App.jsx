@@ -3,7 +3,7 @@ import { useState } from 'react'
 import axios from 'axios'
 
 const API_BASE_URL =
-  import.meta.env.VITE_API_URL || 'https://ahu-ai.onrender.com'
+  import.meta.env.VITE_API_URL || ''
 
 axios.defaults.baseURL = API_BASE_URL
 
@@ -40,30 +40,13 @@ function App() {
     setError('')
     setLoading(true)
 
-    // split user input into separate queries so we always show all outputs
-    const queries = query.split(/,|\n|\|/).map((q) => q.trim()).filter(Boolean)
-
     try {
-      if (queries.length <= 1) {
-        const response = await axios.post('/query', { query }, getRequestConfig())
-        const d = response.data
-        if (Array.isArray(d)) setResults(d)
-        else if (d && d.answers) setResults(d.answers)
-        else if (d && d.answer) setResults([{ query, answer: d.answer }])
-        else setResults([])
-      } else {
-        // send each query separately and aggregate results
-        const promises = queries.map((q) => axios.post('/query', { query: q }, getRequestConfig()))
-        const responses = await Promise.all(promises)
-        const all = []
-        for (let i = 0; i < responses.length; i++) {
-          const d = responses[i].data
-          if (Array.isArray(d)) all.push(...d)
-          else if (d && d.answers) all.push(...d.answers)
-          else if (d && d.answer) all.push({ query: queries[i], answer: d.answer })
-        }
-        setResults(all)
-      }
+      const response = await axios.post('/query', { query }, getRequestConfig())
+      const d = response.data
+      if (Array.isArray(d)) setResults(d)
+      else if (d && d.answers) setResults(d.answers)
+      else if (d && d.answer) setResults([{ query, answer: d.answer }])
+      else setResults([])
     } catch (err) {
       const msg = err?.response?.data || err.message || 'Backend connection failed'
       setError(typeof msg === 'string' ? msg : JSON.stringify(msg))

@@ -3,6 +3,7 @@ from datetime import datetime
 import json
 import urllib.error
 import urllib.request
+import urllib.parse
 from typing import Optional
 from uuid import uuid4
 
@@ -10,7 +11,6 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import pandas as pd
-from rapidfuzz import fuzz, process
 import re
 import os
 
@@ -69,7 +69,7 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-latest").strip()
 ANTHROPIC_BASE_URL = os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com").strip().rstrip("/")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
 GEMINI_BASE_URL = os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta").strip().rstrip("/")
 
 
@@ -126,6 +126,7 @@ class AIPlan(BaseModel):
     column: Optional[str] = None
     value: Optional[str] = None
     value2: Optional[str] = None
+    operator: Optional[str] = None
     statistic: Optional[str] = None
     date_text: Optional[str] = None
     status_value: Optional[str] = None
@@ -171,6 +172,15 @@ def post_json(url, headers, payload, timeout=25):
         raise RuntimeError(f"AI request failed ({exc.code}): {body}") from exc
 
 
+def is_retryable_ai_error(error_message):
+    return any(code in error_message for code in ["503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED"])
+
+
+def normalize_gemini_model_name(model_name):
+    name = (model_name or "").strip()
+    return name.removeprefix("models/")
+
+
 def parse_ai_json(text):
     cleaned = text.strip()
 
@@ -188,24 +198,60 @@ def parse_ai_json(text):
 
 def build_ai_prompt(query, frame):
     schema = frame_summary(frame)
-    return (
-        "You are a data query planner for a pandas dataframe. "
-        "Return only valid JSON that matches one of these actions: "
-        "stat, filter, categorical_count, percentage, latest, date_filter, row_count, explain. "
-        "Choose the smallest safe action that answers the query. "
-        "Do not write pandas code. Do not include markdown.\n\n"
-        f"Query: {query}\n"
-        f"Schema: {json.dumps(schema, ensure_ascii=False)}\n\n"
-        "JSON shape examples:\n"
-        "{""action"": ""stat"", ""column"": ""Supply Air Temp."", ""statistic"": ""mean""}\n"
-        "{""action"": ""filter"", ""column"": ""Return Air Temperature"", ""value"": ""30"", ""operator"": ">"}\n"
-        "{""action"": ""categorical_count"", ""column"": ""Run Status."", ""value"": ""running""}\n"
-        "{""action"": ""date_filter"", ""column"": ""DateTime"", ""date_text"": ""April 15""}\n"
-        "{""action"": ""percentage"", ""column"": ""Run Status."", ""value"": ""running""}\n"
-        "{""action"": ""row_count""}\n"
-        "{""action"": ""explain"", ""rationale"": ""why the query cannot be answered safely""}\n"
-    )
+    schema_text = json.dumps(schema, ensure_ascii=False)
+    return f"""You are a data query planner for a pandas dataframe.
+Return only valid JSON with one of these actions: stat, filter, categorical_count, percentage, latest, date_filter, row_count, explain.
+Use only exact column names from the schema.
+Choose the smallest safe action that answers the query.
+Do not write pandas code. Do not include markdown.
 
+Query: {query}
+Schema: {schema_text}
+
+JSON shape examples:
+{{"action": "stat", "column": "Supply Air Temp.", "statistic": "mean"}}
+{{"action": "filter", "column": "Return Air Temperature", "value": "30", "operator": ">"}}
+{{"action": "categorical_count", "column": "Run Status.", "value": "running"}}
+{{"action": "date_filter", "column": "DateTime", "date_text": "April 15"}}
+{{"action": "percentage", "column": "Run Status.", "value": "running"}}
+{{"action": "row_count"}}
+{{"action": "explain", "rationale": "why the query cannot be answered safely"}}
+"""
+
+def resolve_exact_column(frame, column_name):
+    if not column_name:
+        return None
+
+    normalized_target = normalize_text(column_name)
+
+    for column in frame.columns:
+        if normalize_text(column) == normalized_target:
+            return column
+
+    return None
+
+
+def find_query_column(query, frame, prefer_numeric=True):
+    normalized_query = normalize_text(query)
+    candidates = []
+
+    for column in frame.columns:
+        normalized_column = normalize_text(column)
+        if not normalized_column or normalized_column not in normalized_query:
+            continue
+
+        is_numeric = pd.api.types.is_numeric_dtype(frame[column]) or pd.to_numeric(frame[column], errors="coerce").notna().any()
+        score = len(normalized_column.split())
+        if prefer_numeric and is_numeric:
+            score += 10
+
+        candidates.append((score, column))
+
+    if not candidates:
+        return None
+
+    candidates.sort(reverse=True)
+    return candidates[0][1]
 
 def call_openai_ai(query, frame):
     prompt = build_ai_prompt(query, frame)
@@ -273,24 +319,48 @@ def call_gemini_ai(query, frame):
         },
     }
 
-    response = post_json(
-        f"{GEMINI_BASE_URL}/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}",
-        {
-            "Content-Type": "application/json",
-        },
-        payload,
-    )
+    model_candidates = [
+        normalize_gemini_model_name(GEMINI_MODEL),
+        "gemini-2.0-flash-lite-001",
+        "gemini-flash-lite-latest",
+        "gemini-2.0-flash",
+    ]
+    seen_models = set()
+    last_error = None
 
-    candidates = response.get("candidates", [])
-    if not candidates:
-        raise RuntimeError("Gemini returned no candidates")
+    for model_name in model_candidates:
+        if not model_name or model_name in seen_models:
+            continue
+        seen_models.add(model_name)
 
-    parts = candidates[0].get("content", {}).get("parts", [])
-    content = "\n".join(part.get("text", "") for part in parts if part.get("text"))
-    if not content:
-        raise RuntimeError("Gemini returned empty content")
+        try:
+            response = post_json(
+                f"{GEMINI_BASE_URL}/models/{urllib.parse.quote(model_name, safe='')}:generateContent?key={GEMINI_API_KEY}",
+                {
+                    "Content-Type": "application/json",
+                },
+                payload,
+            )
 
-    return AIPlan.model_validate(parse_ai_json(content))
+            candidates = response.get("candidates", [])
+            if not candidates:
+                raise RuntimeError("Gemini returned no candidates")
+
+            parts = candidates[0].get("content", {}).get("parts", [])
+            content = "\n".join(part.get("text", "") for part in parts if part.get("text"))
+            if not content:
+                raise RuntimeError("Gemini returned empty content")
+
+            return AIPlan.model_validate(parse_ai_json(content))
+        except RuntimeError as exc:
+            last_error = str(exc)
+            if not is_retryable_ai_error(last_error):
+                raise
+
+    if last_error:
+        raise RuntimeError(last_error)
+
+    raise RuntimeError("Gemini request failed")
 
 
 def generate_ai_plan(query, frame):
@@ -309,10 +379,24 @@ def generate_ai_plan(query, frame):
     return None
 
 
+def generate_ai_plan_or_error(query, frame):
+    plan = generate_ai_plan(query, frame)
+    if plan is None:
+        raise RuntimeError("LLM planning is not configured. Add GEMINI_API_KEY, OPENAI_API_KEY, or ANTHROPIC_API_KEY to .env.")
+
+    return plan
+
+
 def resolve_ai_plan(plan, query, frame):
     action = (plan.action or "").strip().lower()
-    column = plan.column
+    column = resolve_exact_column(frame, plan.column)
     target_frame = frame
+
+    if plan.column and column is None and action not in {"row_count", "explain"}:
+        return {
+            "query": query,
+            "answer": f"The model selected an unknown column: {plan.column}",
+        }
 
     if action in {"row_count", "count_rows"}:
         return {
@@ -322,6 +406,10 @@ def resolve_ai_plan(plan, query, frame):
 
     if action == "date_filter" and plan.date_text:
         filtered, label = apply_date_filter(target_frame, plan.date_text)
+        extreme_answer = resolve_extreme_timestamp_answer(query, target_frame)
+        if extreme_answer is not None:
+            return extreme_answer
+
         if column and column in filtered.columns:
             return {
                 "query": query,
@@ -400,10 +488,10 @@ def resolve_ai_plan(plan, query, frame):
                 number = None
 
             if number is not None:
-                operator = (plan.rationale or "").lower()
-                if ">" in operator or "above" in operator or "exceed" in operator or "greater" in operator:
+                operator = (plan.operator or "").strip().lower()
+                if operator in {">", "gt", "above", "exceed", "greater", "greater than", "more than", "over"}:
                     filtered = target_frame[numeric_series > number]
-                elif "<" in operator or "below" in operator or "less" in operator or "under" in operator:
+                elif operator in {"<", "lt", "below", "less", "less than", "under"}:
                     filtered = target_frame[numeric_series < number]
                 else:
                     filtered = target_frame[numeric_series == number]
@@ -522,21 +610,6 @@ def get_datetime_column(frame):
     for col in frame.columns:
         if pd.api.types.is_datetime64_any_dtype(frame[col]):
             return col
-
-    return None
-
-
-def find_best_column(query, frame, numeric_only=False, threshold=60):
-    columns = get_numeric_columns(frame) if numeric_only else list(frame.columns)
-
-    if not columns:
-        return None
-
-    normalized_query = normalize_text(query)
-    match = process.extractOne(normalized_query, columns, scorer=fuzz.WRatio)
-
-    if match and match[1] >= threshold:
-        return match[0]
 
     return None
 
@@ -661,140 +734,83 @@ def build_stat_answer(statistic, column, series):
 
     return f"Matched column: {column}"
 
+
+def resolve_extreme_timestamp_answer(query, frame):
+    lowered_query = query.lower()
+    if not any(keyword in lowered_query for keyword in ["timestamp", "time", "when"]):
+        return None
+
+    if not any(keyword in lowered_query for keyword in ["maximum", "highest", "largest", "minimum", "lowest", "smallest"]):
+        return None
+
+    filtered, label = apply_date_filter(frame, query)
+    working_frame = filtered if not filtered.empty else frame
+
+    value_column = find_query_column(query, working_frame)
+    if not value_column:
+        numeric_columns = get_numeric_columns(working_frame)
+        if not numeric_columns:
+            return None
+        value_column = numeric_columns[0]
+
+    numeric_series = pd.to_numeric(working_frame[value_column], errors="coerce")
+    valid_rows = working_frame[numeric_series.notna()]
+    if valid_rows.empty:
+        return None
+
+    is_max = any(keyword in lowered_query for keyword in ["maximum", "highest", "largest"])
+    idx = numeric_series.idxmax() if is_max else numeric_series.idxmin()
+    value = numeric_series.loc[idx]
+    timestamp_column = get_datetime_column(working_frame)
+    timestamp_text = ""
+
+    if timestamp_column and timestamp_column in working_frame.columns:
+        timestamp_value = working_frame.loc[idx, timestamp_column]
+        if pd.notna(timestamp_value):
+            timestamp_text = f" at {timestamp_value}"
+
+    label_text = label or "the requested period"
+    prefix = "Maximum" if is_max else "Minimum"
+
+    return {
+        "query": query,
+        "answer": f"{prefix} value in {value_column} on {label_text} was {value}{timestamp_text}",
+        "data": [valid_rows.loc[idx].fillna("").to_dict()],
+    }
+
 def process_single_query(query, frame=None):
     working_frame = frame if frame is not None else df
-    query_clean = query.lower().strip()
 
     if working_frame.empty:
         return {"query": query, "answer": "Please upload a dataset first"}
 
-    ai_plan = None
     try:
-        ai_plan = generate_ai_plan(query, working_frame)
+        ai_plan = generate_ai_plan_or_error(query, working_frame)
     except Exception as exc:
-        ai_plan = None
-
-    if ai_plan is not None:
-        ai_result = resolve_ai_plan(ai_plan, query, working_frame)
-        if ai_result is not None:
-            ai_result.setdefault("query", query)
-            return ai_result
-
-    working_frame, date_label = apply_date_filter(working_frame, query_clean)
-    status_column = find_status_column(working_frame)
-    status_value = extract_status_value(query_clean)
-
-    if status_column and status_value:
-        status_mask = working_frame[status_column].astype(str).str.lower().str.contains(status_value, na=False)
-        filtered_frame = working_frame[status_mask]
-    else:
-        filtered_frame = working_frame
-
-    if any(keyword in query_clean for keyword in ["total number of records", "number of records", "how many records"]):
+        fallback_answer = resolve_extreme_timestamp_answer(query, working_frame)
+        if fallback_answer is not None:
+            return fallback_answer
         return {
             "query": query,
-            "answer": f"Total records: {len(filtered_frame)}",
+            "answer": str(exc),
         }
 
-    threshold_requested = any(
-        keyword in query_clean
-        for keyword in ["below", "less than", "under", "above", "exceed", "greater than", "more than", "over", "between"]
-    )
+    ai_result = resolve_ai_plan(ai_plan, query, working_frame)
+    if ai_result is not None:
+        ai_result.setdefault("query", query)
+        if (ai_plan.action or "").strip().lower() == "explain":
+            fallback_answer = resolve_extreme_timestamp_answer(query, working_frame)
+            if fallback_answer is not None:
+                return fallback_answer
+        return ai_result
 
-    if status_column and status_value:
-        if any(phrase in query_clean for phrase in ["how many times", "count of each", "count each", "value counts"]):
-            count = len(filtered_frame)
-            return {
-                "query": query,
-                "answer": f"Found {count} rows where {status_column} contains {status_value}",
-                "data": filtered_frame.head(10).fillna("").to_dict(orient="records"),
-            }
-
-        if "percentage" in query_clean:
-            total = len(working_frame)
-            count = len(filtered_frame)
-            percentage = round((count / total) * 100, 2) if total else 0
-            return {
-                "query": query,
-                "answer": f"{status_value.title()} rows represent {percentage}% of the dataset",
-            }
-
-    statistic = detect_statistic(query_clean)
-    numeric_column = find_best_column(query_clean, filtered_frame, numeric_only=True, threshold=60)
-    general_column = find_best_column(query_clean, filtered_frame, numeric_only=False, threshold=55)
-
-    if threshold_requested:
-        threshold_column = numeric_column or general_column
-        if threshold_column:
-            threshold_frame, threshold_label = apply_threshold_filter(filtered_frame, query_clean, threshold_column)
-            if threshold_frame is not None:
-                comparator = threshold_label or "the requested threshold"
-                return {
-                    "query": query,
-                    "answer": f"Found {len(threshold_frame)} rows where {threshold_column} is {comparator}",
-                    "data": threshold_frame.head(10).fillna("").to_dict(orient="records"),
-                }
-
-    if numeric_column:
-        numeric_series = pd.to_numeric(filtered_frame[numeric_column], errors="coerce").dropna()
-
-        if statistic and not numeric_series.empty:
-            return {
-                "query": query,
-                "answer": build_stat_answer(statistic, numeric_column, numeric_series),
-            }
-
-        threshold_frame, threshold_label = apply_threshold_filter(filtered_frame, query_clean, numeric_column)
-        if threshold_frame is not None:
-            comparator = threshold_label or "the requested threshold"
-            return {
-                "query": query,
-                "answer": f"Found {len(threshold_frame)} rows where {numeric_column} is {comparator}",
-                "data": threshold_frame.head(10).fillna("").to_dict(orient="records"),
-            }
-
-        if date_label:
-            return {
-                "query": query,
-                "answer": f"Found {len(filtered_frame)} readings for {numeric_column} on {date_label}",
-                "data": filtered_frame.head(10).fillna("").to_dict(orient="records"),
-            }
-
-        if "latest" in query_clean and not filtered_frame.empty:
-            return {
-                "query": query,
-                "answer": f"Latest value in {numeric_column} is {filtered_frame[numeric_column].iloc[-1]}",
-            }
-
-        return {
-            "query": query,
-            "answer": f"Matched column: {numeric_column}",
-        }
-
-    if general_column:
-        if status_column and general_column == status_column and status_value:
-            count = len(filtered_frame)
-            return {
-                "query": query,
-                "answer": f"Found {count} rows where {status_column} contains {status_value}",
-                "data": filtered_frame.head(10).fillna("").to_dict(orient="records"),
-            }
-
-        if date_label:
-            return {
-                "query": query,
-                "answer": f"Found {len(filtered_frame)} rows on {date_label}",
-                "data": filtered_frame.head(10).fillna("").to_dict(orient="records"),
-            }
-
-        return {
-            "query": query,
-            "answer": f"Matched column: {general_column}",
-        }
+    fallback_answer = resolve_extreme_timestamp_answer(query, working_frame)
+    if fallback_answer is not None:
+        return fallback_answer
 
     return {
         "query": query,
-        "answer": "No matching column found",
+        "answer": "The LLM plan could not be resolved.",
     }
 
 @app.get("/")
@@ -843,7 +859,9 @@ def query_data(request: QueryRequest, x_session_id: Optional[str] = Header(defau
 
     raw_query = request.query
 
-    split_queries = re.split(r',|\n|\|', raw_query)
+    split_queries = [raw_query]
+    if "\n" in raw_query or "|" in raw_query or ";" in raw_query:
+        split_queries = [part.strip() for part in re.split(r"\n|\||;", raw_query) if part.strip()]
 
     results = []
 
