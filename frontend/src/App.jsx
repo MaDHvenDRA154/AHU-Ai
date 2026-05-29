@@ -2,6 +2,11 @@
 import { useState } from 'react'
 import axios from 'axios'
 
+const API_BASE_URL =
+  import.meta.env.VITE_API_URL || 'https://ahu-ai.onrender.com'
+
+axios.defaults.baseURL = API_BASE_URL
+
 function App() {
   const [query, setQuery] = useState('')
   const [results, setResults] = useState([])
