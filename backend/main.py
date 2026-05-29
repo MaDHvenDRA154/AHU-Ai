@@ -1,9 +1,16 @@
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from datetime import datetime
+import json
+import urllib.error
+import urllib.request
+from typing import Optional
+from uuid import uuid4
+
+from fastapi import FastAPI, UploadFile, File, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import pandas as pd
-from rapidfuzz import process
+from rapidfuzz import fuzz, process
 import re
 import os
 
@@ -22,13 +29,450 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 current_dataset = None
 df = pd.DataFrame()
+datasets = {}
+active_session_id = None
+
+MONTH_MAP = {
+    "january": 1,
+    "february": 2,
+    "march": 3,
+    "april": 4,
+    "may": 5,
+    "june": 6,
+    "july": 7,
+    "august": 8,
+    "september": 9,
+    "october": 10,
+    "november": 11,
+    "december": 12,
+}
+
+STAT_KEYWORDS = {
+    "mean": ["average", "avg", "mean"],
+    "median": ["median"],
+    "max": ["maximum", "max", "highest", "largest"],
+    "min": ["minimum", "min", "lowest", "smallest"],
+    "std": ["standard deviation", "std dev", "stdev", "standard dev", "std"],
+    "count": ["count", "total number of records", "number of records", "how many records"],
+}
+
+STATUS_ALIASES = {
+    "running": ["running", "run", "running status"],
+    "stopped": ["stopped", "stop", "stopping", "stopped status"],
+}
+
+AI_PROVIDER = os.getenv("AI_PROVIDER", "").strip().lower()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip().rstrip("/")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-latest").strip()
+ANTHROPIC_BASE_URL = os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com").strip().rstrip("/")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash").strip()
+GEMINI_BASE_URL = os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta").strip().rstrip("/")
+
+
+def load_local_env_file():
+    env_paths = [
+        os.path.join(os.path.dirname(__file__), ".env"),
+        os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"),
+    ]
+
+    for env_path in env_paths:
+        if not os.path.exists(env_path):
+            continue
+
+        try:
+            with open(env_path, "r", encoding="utf-8") as env_file:
+                for raw_line in env_file:
+                    line = raw_line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+
+                    key, value = line.split("=", 1)
+                    key = key.strip()
+                    value = value.strip().strip('"').strip("'")
+                    os.environ.setdefault(key, value)
+        except Exception:
+            pass
+
+
+load_local_env_file()
+
+AI_PROVIDER = os.getenv("AI_PROVIDER", "").strip().lower()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip().rstrip("/")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-latest").strip()
+ANTHROPIC_BASE_URL = os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com").strip().rstrip("/")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash").strip()
+GEMINI_BASE_URL = os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta").strip().rstrip("/")
+
+if not AI_PROVIDER and OPENAI_API_KEY:
+    AI_PROVIDER = "openai"
+elif not AI_PROVIDER and GEMINI_API_KEY:
+    AI_PROVIDER = "gemini"
 
 class QueryRequest(BaseModel):
     query: str
+    session_id: Optional[str] = None
+
+
+class AIPlan(BaseModel):
+    action: str
+    column: Optional[str] = None
+    value: Optional[str] = None
+    value2: Optional[str] = None
+    statistic: Optional[str] = None
+    date_text: Optional[str] = None
+    status_value: Optional[str] = None
+    limit: Optional[int] = None
+    rationale: Optional[str] = None
+
+
+def normalize_text(value):
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", str(value).lower())).strip()
+
+
+def frame_summary(frame):
+    columns = []
+    for column in frame.columns:
+        series = frame[column]
+        dtype = "datetime" if pd.api.types.is_datetime64_any_dtype(series) else "numeric" if pd.api.types.is_numeric_dtype(series) else "text"
+        sample_values = [str(value) for value in series.dropna().astype(str).head(3).tolist()]
+        columns.append({
+            "name": str(column),
+            "dtype": dtype,
+            "samples": sample_values,
+        })
+
+    return {
+        "row_count": int(len(frame)),
+        "columns": columns,
+    }
+
+
+def ai_enabled():
+    return bool(OPENAI_API_KEY or ANTHROPIC_API_KEY or GEMINI_API_KEY)
+
+
+def post_json(url, headers, payload, timeout=25):
+    data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(url, data=data, headers=headers, method="POST")
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"AI request failed ({exc.code}): {body}") from exc
+
+
+def parse_ai_json(text):
+    cleaned = text.strip()
+
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start != -1 and end != -1 and end >= start:
+        cleaned = cleaned[start : end + 1]
+
+    return json.loads(cleaned)
+
+
+def build_ai_prompt(query, frame):
+    schema = frame_summary(frame)
+    return (
+        "You are a data query planner for a pandas dataframe. "
+        "Return only valid JSON that matches one of these actions: "
+        "stat, filter, categorical_count, percentage, latest, date_filter, row_count, explain. "
+        "Choose the smallest safe action that answers the query. "
+        "Do not write pandas code. Do not include markdown.\n\n"
+        f"Query: {query}\n"
+        f"Schema: {json.dumps(schema, ensure_ascii=False)}\n\n"
+        "JSON shape examples:\n"
+        "{""action"": ""stat"", ""column"": ""Supply Air Temp."", ""statistic"": ""mean""}\n"
+        "{""action"": ""filter"", ""column"": ""Return Air Temperature"", ""value"": ""30"", ""operator"": ">"}\n"
+        "{""action"": ""categorical_count"", ""column"": ""Run Status."", ""value"": ""running""}\n"
+        "{""action"": ""date_filter"", ""column"": ""DateTime"", ""date_text"": ""April 15""}\n"
+        "{""action"": ""percentage"", ""column"": ""Run Status."", ""value"": ""running""}\n"
+        "{""action"": ""row_count""}\n"
+        "{""action"": ""explain"", ""rationale"": ""why the query cannot be answered safely""}\n"
+    )
+
+
+def call_openai_ai(query, frame):
+    prompt = build_ai_prompt(query, frame)
+    payload = {
+        "model": OPENAI_MODEL,
+        "messages": [
+            {"role": "system", "content": "Return JSON only."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0,
+    }
+
+    response = post_json(
+        f"{OPENAI_BASE_URL}/chat/completions",
+        {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        payload,
+    )
+
+    content = response["choices"][0]["message"]["content"]
+    return AIPlan.model_validate(parse_ai_json(content))
+
+
+def call_anthropic_ai(query, frame):
+    prompt = build_ai_prompt(query, frame)
+    payload = {
+        "model": ANTHROPIC_MODEL,
+        "max_tokens": 700,
+        "temperature": 0,
+        "messages": [
+            {"role": "user", "content": prompt},
+        ],
+    }
+
+    response = post_json(
+        f"{ANTHROPIC_BASE_URL}/v1/messages",
+        {
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        payload,
+    )
+
+    text_blocks = [part.get("text", "") for part in response.get("content", []) if part.get("type") == "text"]
+    content = "\n".join(text_blocks)
+    return AIPlan.model_validate(parse_ai_json(content))
+
+
+def call_gemini_ai(query, frame):
+    prompt = build_ai_prompt(query, frame)
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": "Return JSON only."},
+                    {"text": prompt},
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0,
+        },
+    }
+
+    response = post_json(
+        f"{GEMINI_BASE_URL}/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}",
+        {
+            "Content-Type": "application/json",
+        },
+        payload,
+    )
+
+    candidates = response.get("candidates", [])
+    if not candidates:
+        raise RuntimeError("Gemini returned no candidates")
+
+    parts = candidates[0].get("content", {}).get("parts", [])
+    content = "\n".join(part.get("text", "") for part in parts if part.get("text"))
+    if not content:
+        raise RuntimeError("Gemini returned empty content")
+
+    return AIPlan.model_validate(parse_ai_json(content))
+
+
+def generate_ai_plan(query, frame):
+    if not ai_enabled():
+        return None
+
+    if AI_PROVIDER == "gemini" or (GEMINI_API_KEY and not OPENAI_API_KEY and not ANTHROPIC_API_KEY):
+        return call_gemini_ai(query, frame)
+
+    if AI_PROVIDER == "anthropic" or (ANTHROPIC_API_KEY and not OPENAI_API_KEY):
+        return call_anthropic_ai(query, frame)
+
+    if OPENAI_API_KEY:
+        return call_openai_ai(query, frame)
+
+    return None
+
+
+def resolve_ai_plan(plan, query, frame):
+    action = (plan.action or "").strip().lower()
+    column = plan.column
+    target_frame = frame
+
+    if action in {"row_count", "count_rows"}:
+        return {
+            "query": query,
+            "answer": f"Total records: {len(target_frame)}",
+        }
+
+    if action == "date_filter" and plan.date_text:
+        filtered, label = apply_date_filter(target_frame, plan.date_text)
+        if column and column in filtered.columns:
+            return {
+                "query": query,
+                "answer": f"Found {len(filtered)} readings for {column} on {label or plan.date_text}",
+                "data": filtered.head(10).fillna("").to_dict(orient="records"),
+            }
+
+        return {
+            "query": query,
+            "answer": f"Found {len(filtered)} rows on {label or plan.date_text}",
+            "data": filtered.head(10).fillna("").to_dict(orient="records"),
+        }
+
+    if action == "categorical_count" and column and column in target_frame.columns:
+        normalized_value = (plan.value or plan.status_value or "").strip().lower()
+        if normalized_value:
+            filtered = target_frame[target_frame[column].astype(str).str.lower().str.contains(normalized_value, na=False)]
+            return {
+                "query": query,
+                "answer": f"Found {len(filtered)} rows where {column} contains {normalized_value}",
+                "data": filtered.head(10).fillna("").to_dict(orient="records"),
+            }
+
+        counts = target_frame[column].astype(str).value_counts()
+        return {
+            "query": query,
+            "answer": f"Top values in {column}: {counts.head(5).to_dict()}",
+        }
+
+    if action == "percentage" and column and column in target_frame.columns:
+        normalized_value = (plan.value or plan.status_value or "").strip().lower()
+        if normalized_value:
+            total = len(target_frame)
+            filtered = target_frame[target_frame[column].astype(str).str.lower().str.contains(normalized_value, na=False)]
+            percentage = round((len(filtered) / total) * 100, 2) if total else 0
+            return {
+                "query": query,
+                "answer": f"{normalized_value.title()} rows represent {percentage}% of the dataset",
+            }
+
+    if action == "latest" and column and column in target_frame.columns:
+        return {
+            "query": query,
+            "answer": f"Latest value in {column} is {target_frame[column].iloc[-1]}",
+        }
+
+    if action == "stat" and column and column in target_frame.columns:
+        statistic = (plan.statistic or "").strip().lower()
+        numeric_series = pd.to_numeric(target_frame[column], errors="coerce").dropna()
+        if not numeric_series.empty:
+            normalized_stat = {
+                "average": "mean",
+                "avg": "mean",
+                "mean": "mean",
+                "median": "median",
+                "maximum": "max",
+                "max": "max",
+                "minimum": "min",
+                "min": "min",
+                "std": "std",
+                "standard deviation": "std",
+            }.get(statistic, statistic)
+            if normalized_stat in {"mean", "median", "max", "min", "std"}:
+                return {
+                    "query": query,
+                    "answer": build_stat_answer(normalized_stat, column, numeric_series),
+                }
+
+    if action == "filter" and column and column in target_frame.columns:
+        threshold_value = plan.value or plan.value2
+        if threshold_value is not None:
+            numeric_series = pd.to_numeric(target_frame[column], errors="coerce")
+            try:
+                number = float(threshold_value)
+            except ValueError:
+                number = None
+
+            if number is not None:
+                operator = (plan.rationale or "").lower()
+                if ">" in operator or "above" in operator or "exceed" in operator or "greater" in operator:
+                    filtered = target_frame[numeric_series > number]
+                elif "<" in operator or "below" in operator or "less" in operator or "under" in operator:
+                    filtered = target_frame[numeric_series < number]
+                else:
+                    filtered = target_frame[numeric_series == number]
+
+                return {
+                    "query": query,
+                    "answer": f"Found {len(filtered)} rows where {column} matches the requested filter",
+                    "data": filtered.head(10).fillna("").to_dict(orient="records"),
+                }
+
+    if action == "explain" and plan.rationale:
+        return {
+            "query": query,
+            "answer": plan.rationale,
+        }
+
+    return None
+
+
+def get_session_frame(session_id=None):
+    if session_id and session_id in datasets:
+        return datasets[session_id]["df"]
+
+    if active_session_id and active_session_id in datasets:
+        return datasets[active_session_id]["df"]
+
+    return df
+
+
+def store_dataset(frame, path, filename):
+    global df, current_dataset, active_session_id
+
+    session_id = str(uuid4())
+    datasets[session_id] = {
+        "df": frame,
+        "path": path,
+        "filename": filename,
+    }
+    df = frame
+    current_dataset = path
+    active_session_id = session_id
+    return session_id
+
+
+def parse_datetime_columns(frame):
+    loaded = frame.copy()
+
+    for column in loaded.columns:
+        column_name = str(column).lower()
+
+        if any(token in column_name for token in ["datetime", "date", "timestamp", "time"]):
+            loaded[column] = pd.to_datetime(loaded[column], errors="coerce")
+
+    return loaded
+
+
+def clean_sensor_columns(frame):
+    loaded = frame.copy()
+
+    for column in loaded.columns:
+        column_name = str(column).lower()
+
+        if ("temp" in column_name or "temperature" in column_name) and "set point" not in column_name:
+            numeric_series = pd.to_numeric(loaded[column], errors="coerce")
+            loaded[column] = numeric_series.mask(numeric_series < 1)
+
+    return loaded
 
 def load_dataset(path):
-    global df, current_dataset
-
     if path.endswith(".csv"):
         loaded = pd.read_csv(path)
     else:
@@ -46,167 +490,349 @@ def load_dataset(path):
     loaded.columns = [str(col).strip() for col in loaded.columns]
     loaded = loaded.loc[:, loaded.notna().any()]
 
-    df = loaded
-    current_dataset = path
+    if loaded.empty:
+        raise ValueError("Uploaded file contains no data rows")
 
-def get_numeric_columns():
+    loaded = parse_datetime_columns(loaded)
+    loaded = clean_sensor_columns(loaded)
+
+    return loaded
+
+
+def get_numeric_columns(frame):
     cols = []
 
-    for col in df.columns:
+    for col in frame.columns:
         try:
-            numeric_series = pd.to_numeric(df[col], errors="coerce").dropna()
+            numeric_series = pd.to_numeric(frame[col], errors="coerce").dropna()
             if len(numeric_series) > 0:
                 cols.append(col)
-        except:
+        except Exception:
             pass
 
     return cols
 
-def find_best_column(query):
-    numeric_cols = get_numeric_columns()
 
-    if numeric_cols:
-        match = process.extractOne(query, numeric_cols)
+def get_datetime_column(frame):
+    for col in frame.columns:
+        column_name = str(col).lower()
+        if any(token in column_name for token in ["datetime", "date", "timestamp"]):
+            return col
 
-        if match:
-            return match[0]
+    for col in frame.columns:
+        if pd.api.types.is_datetime64_any_dtype(frame[col]):
+            return col
 
-    match = process.extractOne(query, list(df.columns))
+    return None
 
-    if match:
+
+def find_best_column(query, frame, numeric_only=False, threshold=60):
+    columns = get_numeric_columns(frame) if numeric_only else list(frame.columns)
+
+    if not columns:
+        return None
+
+    normalized_query = normalize_text(query)
+    match = process.extractOne(normalized_query, columns, scorer=fuzz.WRatio)
+
+    if match and match[1] >= threshold:
         return match[0]
 
     return None
 
-def process_single_query(query):
-    query = query.lower().strip()
 
-    column = find_best_column(query)
+def detect_statistic(query):
+    lowered = query.lower()
 
-    if not column:
-        return {"query": query, "answer": "No matching column found"}
+    for stat_name, keywords in STAT_KEYWORDS.items():
+        if any(keyword in lowered for keyword in keywords):
+            return stat_name
 
+    return None
+
+
+def extract_status_value(query):
+    lowered = query.lower()
+
+    for canonical, aliases in STATUS_ALIASES.items():
+        if any(re.search(rf"\b{re.escape(alias)}\b", lowered) for alias in aliases):
+            return canonical
+
+    return None
+
+
+def find_status_column(frame):
+    status_columns = [col for col in frame.columns if any(token in str(col).lower() for token in ["status", "state"])]
+
+    if status_columns:
+        return status_columns[0]
+
+    text_columns = [col for col in frame.columns if col not in get_numeric_columns(frame)]
+
+    if text_columns:
+        return text_columns[0]
+
+    return None
+
+
+def apply_date_filter(frame, query):
+    date_column = get_datetime_column(frame)
+
+    if not date_column:
+        return frame, None
+
+    dt_series = pd.to_datetime(frame[date_column], errors="coerce")
+    lowered = query.lower()
+
+    if "first week" in lowered:
+        non_null = dt_series.dropna()
+        if non_null.empty:
+            return frame, None
+
+        start = non_null.min().normalize()
+        end = start + pd.Timedelta(days=7)
+        filtered = frame[(dt_series >= start) & (dt_series < end)]
+        return filtered, f"the first week starting {start.date()}"
+
+    month_match = re.search(r"\b(" + "|".join(MONTH_MAP.keys()) + r")\b", lowered)
+    if not month_match:
+        return frame, None
+
+    month_name = month_match.group(1)
+    month_number = MONTH_MAP[month_name]
+    filtered = frame[dt_series.dt.month == month_number]
+    label = month_name.title()
+
+    year_match = re.search(r"\b(20\d{2})\b", lowered)
+    if year_match:
+        year = int(year_match.group(1))
+        filtered = filtered[dt_series.loc[filtered.index].dt.year == year]
+        label = f"{label} {year}"
+
+    day_match = re.search(rf"\b{month_name}\s+(\d{{1,2}})(?:st|nd|rd|th)?\b", lowered)
+    if day_match:
+        day = int(day_match.group(1))
+        filtered = filtered[dt_series.loc[filtered.index].dt.day == day]
+        label = f"{label} {day}"
+
+    return filtered, label
+
+
+def apply_threshold_filter(frame, query, column):
+    lowered = query.lower()
+    numbers = [float(value) for value in re.findall(r"-?\d+(?:\.\d+)?", lowered)]
+
+    if "between" in lowered and len(numbers) >= 2:
+        low, high = sorted(numbers[:2])
+        filtered = frame[
+            pd.to_numeric(frame[column], errors="coerce").between(low, high, inclusive="both")
+        ]
+        return filtered, f"between {low} and {high}"
+
+    if not numbers:
+        return None, None
+
+    threshold = numbers[0]
+
+    if any(keyword in lowered for keyword in ["below", "less than", "under"]):
+        filtered = frame[pd.to_numeric(frame[column], errors="coerce") < threshold]
+        return filtered, f"below {threshold}"
+
+    if any(keyword in lowered for keyword in ["above", "exceed", "greater than", "more than", "over"]):
+        filtered = frame[pd.to_numeric(frame[column], errors="coerce") > threshold]
+        return filtered, f"above {threshold}"
+
+    return None, None
+
+
+def build_stat_answer(statistic, column, series):
+    if statistic == "mean":
+        return f"Average value in {column} is {round(series.mean(), 2)}"
+    if statistic == "median":
+        return f"Median of {column} is {round(series.median(), 2)}"
+    if statistic == "max":
+        return f"Maximum value in {column} is {series.max()}"
+    if statistic == "min":
+        return f"Minimum value in {column} is {series.min()}"
+    if statistic == "std":
+        return f"Standard deviation of {column} is {round(series.std(), 2)}"
+    if statistic == "count":
+        return f"Count of {column} is {series.count()}"
+
+    return f"Matched column: {column}"
+
+def process_single_query(query, frame=None):
+    working_frame = frame if frame is not None else df
+    query_clean = query.lower().strip()
+
+    if working_frame.empty:
+        return {"query": query, "answer": "Please upload a dataset first"}
+
+    ai_plan = None
     try:
-        numeric_series = pd.to_numeric(df[column], errors="coerce").dropna()
+        ai_plan = generate_ai_plan(query, working_frame)
+    except Exception as exc:
+        ai_plan = None
 
-        if len(numeric_series) == 0:
-            return {"query": query, "answer": f"{column} is not numeric"}
+    if ai_plan is not None:
+        ai_result = resolve_ai_plan(ai_plan, query, working_frame)
+        if ai_result is not None:
+            ai_result.setdefault("query", query)
+            return ai_result
 
-        if "maximum" in query or "max" in query:
+    working_frame, date_label = apply_date_filter(working_frame, query_clean)
+    status_column = find_status_column(working_frame)
+    status_value = extract_status_value(query_clean)
+
+    if status_column and status_value:
+        status_mask = working_frame[status_column].astype(str).str.lower().str.contains(status_value, na=False)
+        filtered_frame = working_frame[status_mask]
+    else:
+        filtered_frame = working_frame
+
+    if any(keyword in query_clean for keyword in ["total number of records", "number of records", "how many records"]):
+        return {
+            "query": query,
+            "answer": f"Total records: {len(filtered_frame)}",
+        }
+
+    threshold_requested = any(
+        keyword in query_clean
+        for keyword in ["below", "less than", "under", "above", "exceed", "greater than", "more than", "over", "between"]
+    )
+
+    if status_column and status_value:
+        if any(phrase in query_clean for phrase in ["how many times", "count of each", "count each", "value counts"]):
+            count = len(filtered_frame)
             return {
                 "query": query,
-                "answer": f"Maximum value in {column} is {numeric_series.max()}"
+                "answer": f"Found {count} rows where {status_column} contains {status_value}",
+                "data": filtered_frame.head(10).fillna("").to_dict(orient="records"),
             }
 
-        elif "minimum" in query or "min" in query:
+        if "percentage" in query_clean:
+            total = len(working_frame)
+            count = len(filtered_frame)
+            percentage = round((count / total) * 100, 2) if total else 0
             return {
                 "query": query,
-                "answer": f"Minimum value in {column} is {numeric_series.min()}"
+                "answer": f"{status_value.title()} rows represent {percentage}% of the dataset",
             }
 
-        elif "average" in query or "avg" in query or "mean" in query:
-            return {
-                "query": query,
-                "answer": f"Average value in {column} is {round(numeric_series.mean(), 2)}"
-            }
+    statistic = detect_statistic(query_clean)
+    numeric_column = find_best_column(query_clean, filtered_frame, numeric_only=True, threshold=60)
+    general_column = find_best_column(query_clean, filtered_frame, numeric_only=False, threshold=55)
 
-        elif "median" in query:
-            return {
-                "query": query,
-                "answer": f"Median of {column} is {round(numeric_series.median(), 2)}"
-            }
-
-        elif "mode" in query:
-            mode_value = numeric_series.mode()
-
-            if len(mode_value) > 0:
-                mode_value = mode_value.iloc[0]
-
-            return {
-                "query": query,
-                "answer": f"Mode of {column} is {mode_value}"
-            }
-
-        elif (
-            "standard deviation" in query
-            or "std" in query
-            or "std dev" in query
-            or "stdev" in query
-            or "standard dev" in query
-        ):
-            return {
-                "query": query,
-                "answer": f"Standard deviation of {column} is {round(numeric_series.std(), 2)}"
-            }
-
-        elif "count" in query:
-            return {
-                "query": query,
-                "answer": f"Count of {column} is {numeric_series.count()}"
-            }
-
-        elif "latest" in query:
-            return {
-                "query": query,
-                "answer": f"Latest value in {column} is {df[column].iloc[-1]}"
-            }
-
-        elif "above" in query:
-            nums = re.findall(r'\d+', query)
-
-            if nums:
-                threshold = float(nums[0])
-
-                filtered = df[pd.to_numeric(df[column], errors="coerce") > threshold]
-
+    if threshold_requested:
+        threshold_column = numeric_column or general_column
+        if threshold_column:
+            threshold_frame, threshold_label = apply_threshold_filter(filtered_frame, query_clean, threshold_column)
+            if threshold_frame is not None:
+                comparator = threshold_label or "the requested threshold"
                 return {
                     "query": query,
-                    "answer": f"Found {len(filtered)} rows where {column} > {threshold}",
-                    "data": filtered.head(10).fillna("").to_dict(orient="records")
+                    "answer": f"Found {len(threshold_frame)} rows where {threshold_column} is {comparator}",
+                    "data": threshold_frame.head(10).fillna("").to_dict(orient="records"),
                 }
 
+    if numeric_column:
+        numeric_series = pd.to_numeric(filtered_frame[numeric_column], errors="coerce").dropna()
+
+        if statistic and not numeric_series.empty:
+            return {
+                "query": query,
+                "answer": build_stat_answer(statistic, numeric_column, numeric_series),
+            }
+
+        threshold_frame, threshold_label = apply_threshold_filter(filtered_frame, query_clean, numeric_column)
+        if threshold_frame is not None:
+            comparator = threshold_label or "the requested threshold"
+            return {
+                "query": query,
+                "answer": f"Found {len(threshold_frame)} rows where {numeric_column} is {comparator}",
+                "data": threshold_frame.head(10).fillna("").to_dict(orient="records"),
+            }
+
+        if date_label:
+            return {
+                "query": query,
+                "answer": f"Found {len(filtered_frame)} readings for {numeric_column} on {date_label}",
+                "data": filtered_frame.head(10).fillna("").to_dict(orient="records"),
+            }
+
+        if "latest" in query_clean and not filtered_frame.empty:
+            return {
+                "query": query,
+                "answer": f"Latest value in {numeric_column} is {filtered_frame[numeric_column].iloc[-1]}",
+            }
+
         return {
             "query": query,
-            "answer": f"Matched column: {column}"
+            "answer": f"Matched column: {numeric_column}",
         }
 
-    except Exception as e:
+    if general_column:
+        if status_column and general_column == status_column and status_value:
+            count = len(filtered_frame)
+            return {
+                "query": query,
+                "answer": f"Found {count} rows where {status_column} contains {status_value}",
+                "data": filtered_frame.head(10).fillna("").to_dict(orient="records"),
+            }
+
+        if date_label:
+            return {
+                "query": query,
+                "answer": f"Found {len(filtered_frame)} rows on {date_label}",
+                "data": filtered_frame.head(10).fillna("").to_dict(orient="records"),
+            }
+
         return {
             "query": query,
-            "answer": f"Error: {str(e)}"
+            "answer": f"Matched column: {general_column}",
         }
+
+    return {
+        "query": query,
+        "answer": "No matching column found",
+    }
 
 @app.get("/")
 def root():
     return {
         "message": "AHU AI Backend Running",
-        "dataset": current_dataset
+        "dataset": current_dataset,
+        "session_id": active_session_id,
     }
 
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
-    global df
-
     try:
-        filepath = os.path.join(UPLOAD_DIR, file.filename)
+        upload_name = file.filename or "uploaded_file"
+        filepath = os.path.join(UPLOAD_DIR, upload_name)
 
         with open(filepath, "wb") as f:
             f.write(await file.read())
 
-        load_dataset(filepath)
+        loaded = load_dataset(filepath)
+        session_id = store_dataset(loaded, filepath, upload_name)
 
         return {
             "message": "Dataset uploaded successfully",
-            "rows": len(df),
-            "columns": list(df.columns)
+            "rows": len(loaded),
+            "columns": list(loaded.columns),
+            "session_id": session_id,
         }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
 @app.post("/query")
-def query_data(request: QueryRequest):
+def query_data(request: QueryRequest, x_session_id: Optional[str] = Header(default=None)):
+    frame = get_session_frame(request.session_id or x_session_id)
 
-    if df.empty:
+    if frame.empty:
         return {
             "answers": [
                 {
@@ -225,20 +851,24 @@ def query_data(request: QueryRequest):
         q = q.strip()
 
         if q:
-            results.append(process_single_query(q))
+            results.append(process_single_query(q, frame))
 
     return {
         "answers": results
     }
 
 @app.get("/columns")
-def columns():
+def columns(x_session_id: Optional[str] = Header(default=None)):
+    frame = get_session_frame(x_session_id)
+
     return {
-        "columns": list(df.columns)
+        "columns": list(frame.columns)
     }
 
 @app.get("/preview")
-def preview():
+def preview(x_session_id: Optional[str] = Header(default=None)):
+    frame = get_session_frame(x_session_id)
+
     return {
-        "rows": df.head(5).fillna("").to_dict(orient="records")
+        "rows": frame.head(5).fillna("").to_dict(orient="records")
     }

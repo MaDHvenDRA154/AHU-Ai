@@ -8,6 +8,21 @@ function App() {
   const [loading, setLoading] = useState(false)
   const [uploadMessage, setUploadMessage] = useState('')
   const [error, setError] = useState('')
+  const [selectedFileName, setSelectedFileName] = useState('')
+  const [activeDatasetName, setActiveDatasetName] = useState('')
+  const [sessionId, setSessionId] = useState(() => localStorage.getItem('ahu_session_id') || '')
+
+  const getRequestConfig = () => {
+    const storedSessionId = sessionId || localStorage.getItem('ahu_session_id') || ''
+
+    return storedSessionId
+      ? {
+          headers: {
+            'X-Session-Id': storedSessionId,
+          },
+        }
+      : {}
+  }
 
   const handleSubmit = async (e) => {
     e.preventDefault()
@@ -25,7 +40,7 @@ function App() {
 
     try {
       if (queries.length <= 1) {
-        const response = await axios.post('/query', { query })
+        const response = await axios.post('/query', { query }, getRequestConfig())
         const d = response.data
         if (Array.isArray(d)) setResults(d)
         else if (d && d.answers) setResults(d.answers)
@@ -33,7 +48,7 @@ function App() {
         else setResults([])
       } else {
         // send each query separately and aggregate results
-        const promises = queries.map((q) => axios.post('/query', { query: q }))
+        const promises = queries.map((q) => axios.post('/query', { query: q }, getRequestConfig()))
         const responses = await Promise.all(promises)
         const all = []
         for (let i = 0; i < responses.length; i++) {
@@ -60,6 +75,7 @@ function App() {
     // clear previous upload messages when a new file is selected
     setUploadMessage('')
     setError('')
+    setSelectedFileName(file.name)
 
     const formData = new FormData()
     formData.append('file', file)
@@ -76,6 +92,13 @@ function App() {
           }
         }
       )
+
+      if (response.data?.session_id) {
+        localStorage.setItem('ahu_session_id', response.data.session_id)
+        setSessionId(response.data.session_id)
+      }
+
+      setActiveDatasetName(file.name)
 
       setUploadMessage(
         `Uploaded successfully: ${response.data.rows} rows loaded`
@@ -128,6 +151,11 @@ function App() {
               className="w-full rounded-xl bg-black/30 p-3 border border-white/10"
             />
 
+            <div className="mt-2 text-sm text-slate-300 space-y-1">
+              <p>Selected file: {selectedFileName || 'No file selected'}</p>
+              <p>Active dataset: {activeDatasetName || 'No dataset uploaded yet'}</p>
+            </div>
+
             {uploadMessage && (
               (() => {
                 const isError = uploadMessage.toLowerCase().includes('failed') || uploadMessage.toLowerCase().includes('not found')
@@ -174,6 +202,11 @@ function App() {
                       <div className="text-cyan-300 text-sm">Query</div>
                       <div className="mb-2">{item.query || ''}</div>
                       <div className="text-green-400 font-semibold">{item.answer}</div>
+                      {Array.isArray(item.data) && item.data.length > 0 && (
+                        <pre className="mt-3 overflow-x-auto rounded-xl bg-black/40 p-3 text-xs text-slate-200 whitespace-pre-wrap">
+                          {JSON.stringify(item.data, null, 2)}
+                        </pre>
+                      )}
                     </div>
                   ))}
                 </div>
